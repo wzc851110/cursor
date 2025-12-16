@@ -49,13 +49,63 @@ def _get_pro():
     return ts.pro_api(token)
 
 
-def fetch_fund_daily(
+def _ts_code_to_ak_symbol(ts_code: str) -> str:
+    # e.g. 518880.SH -> 518880
+    return ts_code.split(".")[0]
+
+
+def fetch_etf_daily_akshare(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch ETF daily OHLCV from AkShare (Eastmoney).
+
+    Output columns aligned to: open/high/low/close/vol/amount, indexed by trade_date.
+    """
+
+    try:
+        import akshare as ak  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"AkShare not available: {exc}")
+
+    symbol = _ts_code_to_ak_symbol(ts_code)
+    try:
+        raw = ak.fund_etf_hist_em(
+            symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust=""
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"AkShare fund_etf_hist_em failed for {symbol}: {exc}")
+
+    if raw is None or raw.empty:
+        raise SystemExit(f"AkShare returned empty data for {symbol} {start_date}-{end_date}")
+
+    colmap = {
+        "日期": "trade_date",
+        "开盘": "open",
+        "最高": "high",
+        "最低": "low",
+        "收盘": "close",
+        "成交量": "vol",
+        "成交额": "amount",
+    }
+    missing = [c for c in colmap if c not in raw.columns]
+    if missing:
+        raise SystemExit(f"AkShare schema changed; missing columns: {missing}")
+
+    df = raw[list(colmap.keys())].rename(columns=colmap)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.sort_values("trade_date").set_index("trade_date")
+    for c in ["open", "high", "low", "close", "vol", "amount"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"])
+    return df
+
+
+def fetch_etf_daily(
     ts_code: str,
     start_date: str,
     end_date: str,
     cache_csv: str | None = None,
+    source: str = "auto",
 ) -> pd.DataFrame:
-    """Fetch ETF/fund daily data from TuShare.
+    """Fetch ETF daily OHLCV data from TuShare.
 
     Returns a DataFrame indexed by datetime with at least:
       open, high, low, close, vol, amount
@@ -69,6 +119,12 @@ def fetch_fund_daily(
             df = df.set_index("trade_date")
         return df
 
+    if source not in {"auto", "tushare", "akshare"}:
+        raise ValueError("source must be auto|tushare|akshare")
+
+    if source == "akshare":
+        return fetch_etf_daily_akshare(ts_code, start_date, end_date)
+
     pro = _get_pro()
 
     # TuShare may cap rows per request; chunk by year to be safe.
@@ -79,16 +135,39 @@ def fetch_fund_daily(
     for y in range(start_y, end_y + 1):
         s = start_date if y == start_y else f"{y}0101"
         e = end_date if y == end_y else f"{y}1231"
-        try:
-            part = pro.fund_daily(ts_code=ts_code, start_date=s, end_date=e)
-        except Exception as exc:  # noqa: BLE001
-            raise SystemExit(f"TuShare fund_daily failed for {ts_code} {s}-{e}: {exc}")
+        # Many accounts don't have `fund_daily` permission, and some may even
+        # lack basic daily permissions. We'll try best-effort and (optionally)
+        # fallback to AkShare when TuShare denies access.
+        # Fallback to `daily` which often works for ETFs too.
+        part = None
+        last_exc: Exception | None = None
+        for api_name in ("fund_daily", "daily"):
+            try:
+                api = getattr(pro, api_name)
+                part = api(ts_code=ts_code, start_date=s, end_date=e)
+                if part is not None and not part.empty:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                part = None
+                continue
+        if part is None:
+            if source == "auto" and last_exc is not None and "没有接口访问权限" in str(last_exc):
+                # Fallback to AkShare (non-TuShare) to keep the backtest runnable.
+                return fetch_etf_daily_akshare(ts_code, start_date, end_date)
+            raise SystemExit(
+                f"TuShare fetch failed for {ts_code} {s}-{e}. "
+                f"Tried fund_daily/daily. Last error: {last_exc}"
+            )
 
         if part is None or part.empty:
             continue
         frames.append(part)
 
     if not frames:
+        # If TuShare returned nothing, allow auto-fallback.
+        if source == "auto":
+            return fetch_etf_daily_akshare(ts_code, start_date, end_date)
         raise SystemExit(f"No data returned for {ts_code} {start_date}-{end_date}")
 
     df = pd.concat(frames, ignore_index=True)
@@ -360,6 +439,12 @@ def main() -> int:
     ap.add_argument("--outdir", default="out", help="output directory")
     ap.add_argument("--cache", action="store_true", help="cache downloaded data to ./out/cache")
     ap.add_argument("--with-fx", action="store_true", help="try add USD/CNY filter strategy (best-effort)")
+    ap.add_argument(
+        "--data-source",
+        choices=["auto", "tushare", "akshare"],
+        default="auto",
+        help="data source: auto tries TuShare then falls back; tushare/akshare forces source",
+    )
 
     args = ap.parse_args()
 
@@ -367,8 +452,14 @@ def main() -> int:
     cache_dir = outdir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_etf = str(cache_dir / f"{args.ts_code.replace('.', '_')}_{args.start}_{args.end}.csv") if args.cache else None
-    df = fetch_fund_daily(args.ts_code, args.start, args.end, cache_csv=cache_etf)
+    cache_etf = (
+        str(cache_dir / f"{args.data_source}_{args.ts_code.replace('.', '_')}_{args.start}_{args.end}.csv")
+        if args.cache
+        else None
+    )
+    df = fetch_etf_daily(
+        args.ts_code, args.start, args.end, cache_csv=cache_etf, source=args.data_source
+    )
 
     if df.empty:
         raise SystemExit("ETF daily data is empty")
