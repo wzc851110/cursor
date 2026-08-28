@@ -1,0 +1,19 @@
+本目录包含 FOF-ETF 路演 PPT 及相关文件。
+
+【重要】若 PowerPoint 提示“内容有问题”或修复后页面空白，请使用本目录最新版：
+  FOF-ETF产品_吴致超_完整版.pptx
+（已修复：不再使用会破坏文件结构的幻灯片复制方式）
+
+文件清单：
+- FOF-ETF产品_吴致超_完整版.pptx   （完整演示文稿，34页）
+- build_fof_etf_ppt.py              （重新生成 PPT 的脚本）
+- ppt_assets/                       （图表素材）
+
+若 Cloud Agent 无法直接写入你的 D 盘，请在本地 PowerShell 执行：
+
+  New-Item -ItemType Directory -Force -Path "D:\first_cursor_project\FOF-ETF-ppt"
+  Copy-Item -Recurse -Force "<从 Cursor/GitHub 下载的 FOF-ETF-ppt 路径>\*" "D:\first_cursor_project\FOF-ETF-ppt\"
+
+或从 GitHub 拉取后复制：
+  git clone https://github.com/wzc851110/cursor.git
+  Copy-Item -Recurse -Force ".\cursor\FOF-ETF-ppt\*" "D:\first_cursor_project\FOF-ETF-ppt\"
